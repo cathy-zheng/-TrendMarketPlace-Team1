@@ -1,0 +1,574 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: "Blog: Augment your Amazon DynamoDB table with Comprehend for sentiment analysis and Athena for ad-hoc queries across historical activities"
+
+Resources:
+  # =================================================================
+  # Lambda Role
+  # =================================================================
+
+  # Role used by the Lambda functions for execution
+  LambdaRoleForEventsProcessing:
+    Type: AWS::IAM::Role
+    Properties:
+      Policies:
+      - PolicyName: LambdaPolicy
+        PolicyDocument:
+          Version: 2012-10-17
+          Statement:
+          - Effect: Allow
+            Action:
+            - cloudwatch:*
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - firehose:PutRecord
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:GetRecords
+            - dynamodb:UpdateItem
+            - dynamodb:GetShardIterator
+            - dynamodb:DescribeStream
+            - dynamodb:ListStreams
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - comprehend:DetectSentiment
+            Resource: '*'
+          - Effect: Allow
+            Action:
+            - s3:Get*
+            - s3:List*
+            Resource: !Join ["", ["arn:aws:s3:::", AmazonReviewsBucket, "/*"]]
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+        - Effect: Allow
+          Principal: { Service: lambda.amazonaws.com }
+          Action:
+          - sts:AssumeRole
+
+  # Lambda function to process amazon reviews
+  AmazonReviewProcessing:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaRoleForEventsProcessing
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import io
+          import os
+          import gzip
+          import json
+          import boto3
+
+          def get_records(session, bucket, key):
+              """
+              Generator for the bucket and key names of each CloudTrail log
+              file contained in the event sent to this function from S3.
+              (usually only one but this ensures we process them all).
+              :param event: S3:ObjectCreated:Put notification event
+              :return: yields bucket and key names
+              """
+              s3 = session.client('s3')
+              response = s3.get_object(Bucket=bucket, Key=key)
+
+              with io.BytesIO(response['Body'].read()) as obj:
+                  with gzip.GzipFile(fileobj=obj) as logfile:
+                      records = json.load(logfile)
+                      return records
+
+          def handler(event, context):
+              """
+              Checks for API calls with RunInstances, TerminateInstances, and DeleteDBInstance in CloudTrail.
+              if found, send specific records to SQS for processing
+
+              :return: 200, success if records process successfully
+              """
+              session = boto3.session.Session()
+              REGION = os.environ['AWS_REGION']
+              print(REGION)
+              dynamodb = boto3.resource("dynamodb", region_name=REGION)
+              table = dynamodb.Table('AmazonReviews')
+
+              # Get the S3 bucket and key for each log file contained in the event
+              for event_record in event['Records']:
+                  try:
+                      bucket = event_record['s3']['bucket']['name']
+                      key = event_record['s3']['object']['key']
+                      print('Loading Amazon Reviews file s3://{}/{}'.format(bucket, key))
+                      records = get_records(session, bucket, key)
+                      print('Number of records in log file: {}'.format(len(records)))
+
+                      for record in records:
+                          response = table.get_item(Key={'pk': record['product_id'], 'sk': '2099-12-31#PRODUCTSUMMARY'})
+                          if 'Items' not in response:
+                              table.put_item(
+                                  Item={
+                                      'pk': record['product_id'],
+                                      'sk': '2099-12-31#PRODUCTSUMMARY',
+                                      'marketplace': record['marketplace'],
+                                      'product_parent': record['product_parent'],
+                                      'product_title': record['product_title'],
+                                      'product_category': record['product_category'],
+                                  }
+                              )
+                          table.put_item(
+                              Item={
+                                  'pk': record['product_id'],
+                                  'sk': record['review_date'] + '#' + record['review_id'],
+                                  'customer_id': record['customer_id'],
+                                  'star_rating': record['star_rating'],
+                                  'helpful_votes': record['helpful_votes'],
+                                  'total_votes': record['total_votes'],
+                                  'vine': record['vine'],
+                                  'verified_purchase': record['verified_purchase'],
+                                  'review_headline': record['review_headline'],
+                                  'review_body': record['review_body']
+                              }
+                          )
+                  except Exception as e:
+                      print (e)
+                      return {'Exception status': e}
+                  else:
+                      print("records processed successfully!!")
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('records inserted successfully to DynamoDB!!')
+              }
+      Handler: index.handler
+      MemorySize: 3008
+      Role: !GetAtt LambdaRoleForEventsProcessing.Arn
+      Runtime: python3.7
+      Timeout: 900 # max is 300 seconds
+
+  # Permission for the S3 bucket to invoke the Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      FunctionName: !Ref AmazonReviewProcessing
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  # =================================================================
+  # Amazon Review (mock)
+  # S3 bucket where reveiw files will be delivered
+  # =================================================================
+  AmazonReviewsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      NotificationConfiguration:
+        LambdaConfigurations:
+        - Function: !GetAtt AmazonReviewProcessing.Arn
+          Event: "s3:ObjectCreated:Put"
+          Filter:
+            S3Key:
+              Rules:
+                - Name: suffix
+                  Value: json.gz
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+
+  # Policy granting CloudTrail access to the S3 bucket
+  AmazonReviewsPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref AmazonReviewsBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: AWSReviewsAclCheck
+            Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: s3:GetBucketAcl
+            Resource: !GetAtt AmazonReviewsBucket.Arn
+          - Sid: AWSReviewWrite
+            Effect: Allow
+            Principal: { Service: lambda.amazonaws.com}
+            Action: s3:PutObject
+            Resource:
+              - !Sub "${AmazonReviewsBucket.Arn}/*"
+              - !Sub "${AmazonReviewsBucket.Arn}"
+            Condition: # ensure we have control of objects written to the bucket
+              StringEquals:
+                s3:x-amz-acl: "bucket-owner-full-control"
+
+  # =================================================================
+  # Processing Queued event to DynamoDB
+  # for the next layer....
+  # =================================================================
+
+  AmazonReviews:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        -
+          AttributeName: "pk"
+          AttributeType: "S"
+        -
+          AttributeName: "sk"
+          AttributeType: "S"
+      KeySchema:
+        -
+          AttributeName: "pk"
+          KeyType: "HASH"
+        -
+          AttributeName: "sk"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: "5"
+        WriteCapacityUnits: "5"
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      BillingMode: PROVISIONED
+      SSESpecification:
+        SSEEnabled: true
+      StreamSpecification:
+        StreamViewType: "NEW_AND_OLD_IMAGES"
+      TableName: "AmazonReviews"
+
+  # Lambda function to process amazon reviews
+  AmazonReviewsSummary:
+    Type: AWS::Lambda::Function
+    DependsOn: LambdaRoleForEventsProcessing
+    Properties:
+      Code:
+        ZipFile: !Sub |
+          import json
+          import boto3
+          import os
+
+          def convert_file(f):
+              out = {}
+              def convert(element, name=''):
+                  if type(element) is dict:
+                      for sub in element:
+                          convert(element[sub], name + sub + '_')
+                  elif type(element) is list:
+                      ctr = 0
+                      for sub in element:
+                          convert(sub, name + str(ctr) + '_')
+                          ctr += 1
+                  else:
+                      out[name[:-1]] = element
+              convert(f)
+              return out
+
+          def handler(event, context):
+              REGION = os.environ['AWS_REGION']
+              cmphd = boto3.client(service_name='comprehend', region_name=REGION)
+              fh = boto3.client('firehose')
+              ddb = boto3.resource('dynamodb', region_name=REGION)
+              dt=ddb.Table('AmazonReviews')
+              FIREHOSE_URL = os.environ['FIREHOSE_URL']
+              for rec in event['Records']:
+                  if (rec['eventName'] == 'INSERT' and ('review_body' in rec['dynamodb']['NewImage'])):
+                      convt=convert_file(rec)
+                      response = fh.put_record(
+                          DeliveryStreamName=FIREHOSE_URL,
+                          Record={'Data': json.dumps(convt)}
+                      )
+                      review_body=rec['dynamodb']['NewImage']['review_body']['S']
+                      review_body=review_body[:4999]
+                      pk=rec['dynamodb']['Keys']['pk']['S']
+                      sk=rec['dynamodb']['Keys']['sk']['S']
+                      res=cmphd.detect_sentiment(Text=review_body, LanguageCode='en')
+                      st=res['Sentiment']
+                      try:
+                          d_response = dt.put_item(
+                            Item={'pk': pk, 'sk': sk + '#' + 'SENTIMENT', 'sentiment': st}
+                          )
+                          if st == "POSITIVE":
+                              d_s_response = dt.update_item(
+                                  Key={'pk': pk,'sk': '2099-12-31#REVIEWSUMMARY'},
+                                  UpdateExpression="set positive_sentiment_count= if_not_exists(positive_sentiment_count, :start) + :inc",ExpressionAttributeValues={':inc': 1,':start': 0},ReturnValues="UPDATED_NEW"
+                              )
+                          elif st == "NEGATIVE":
+                              d_s_response = dt.update_item(
+                                  Key={'pk': pk,'sk': '2099-12-31#REVIEWSUMMARY'},
+                                  UpdateExpression="set negative_sentiment_count= if_not_exists(negative_sentiment_count, :start) + :inc",ExpressionAttributeValues={':inc': 1,':start': 0},ReturnValues="UPDATED_NEW"
+                              )
+                          elif st == "NEUTRAL":
+                              d_s_response = dt.update_item(
+                                  Key={'pk': pk,'sk': '2099-12-31#REVIEWSUMMARY'},
+                                  UpdateExpression="set neutral_sentiment_count= if_not_exists(neutral_sentiment_count, :start) + :inc",ExpressionAttributeValues={':inc': 1,':start': 0},ReturnValues="UPDATED_NEW"
+                              )
+                          elif st == "MIXED":
+                              d_s_response = dt.update_item(
+                                  Key={'pk': pk,'sk': '2099-12-31#REVIEWSUMMARY'},
+                                  UpdateExpression="set mixed_sentiment_count= if_not_exists(mixed_sentiment_count, :start) + :inc",ExpressionAttributeValues={':inc': 1,':start': 0},ReturnValues="UPDATED_NEW"
+                              )
+                          else:
+                              print("No sentiment value: " + st)
+                      except Exception as e:
+                          return {'Exception status': e}
+                      else:
+                          print("record processed successfully")
+
+      Handler: index.handler
+      MemorySize: 128
+      Role: !GetAtt LambdaRoleForEventsProcessing.Arn
+      Runtime: python3.7
+      Timeout: 30  # max is 30 seconds
+      Environment:
+        Variables:
+          FIREHOSE_URL: !Ref DeliveryStream
+  # =================================================================
+  # Permission for lambda to invoke DynamoDB
+  # =================================================================
+
+  LambdaSummaryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      Principal: dynamodb.amazonaws.com
+      FunctionName: !Ref AmazonReviewsSummary
+      SourceAccount: !Ref 'AWS::AccountId'
+
+  LambdaFunctionReviewSummaryMapping:
+    Type: AWS::Lambda::EventSourceMapping
+    Properties:
+      Enabled: true
+      EventSourceArn: !GetAtt AmazonReviews.StreamArn
+      FunctionName: !GetAtt AmazonReviewsSummary.Arn
+      StartingPosition: LATEST
+
+  # =================================================================
+  # Kinesis FireHose delivery stream for Analytics
+  # =================================================================
+  DeliveryStream:
+    DependsOn:
+      - DeliveryPolicy
+      - FirehoseLogGroup
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamEncryptionConfigurationInput:
+        KeyType: AWS_OWNED_CMK
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Join
+          - ''
+          - - 'arn:aws:s3:::'
+            - !Ref AmazonReviewsParquetBucket
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 64
+        CompressionFormat: UNCOMPRESSED
+        DataFormatConversionConfiguration:
+            InputFormatConfiguration:
+              Deserializer:
+                OpenXJsonSerDe: {}
+            OutputFormatConfiguration:
+              Serializer:
+                ParquetSerDe: {}
+            Enabled: true
+            SchemaConfiguration:
+                DatabaseName: !Ref ReviewDatabase
+                Region: !Ref AWS::Region
+                RoleARN: !GetAtt DeliveryRole.Arn
+                TableName: !Ref ReviewTable
+                VersionId: LATEST
+        Prefix: firehose/
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: 'dynamodbblog'
+        RoleARN: !GetAtt DeliveryRole.Arn
+
+  # =================================================================
+  # Kinesis FireHose log group for logging
+  # =================================================================
+  FirehoseLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Properties:
+      LogGroupName: "/aws/kinesisfirehose/blogdeliverystream"
+      RetentionInDays: 90
+
+  # =================================================================
+  # Kinesis FireHose log stream for logging
+  # =================================================================
+  FirehoseS3DeliveryLogStream:
+    Type: "AWS::Logs::LogStream"
+    DependsOn: FirehoseLogGroup
+    Properties:
+      LogGroupName: !Ref FirehoseLogGroup
+      LogStreamName: 'dynamodbblog'
+
+  # =================================================================
+  # S3 bucket for storing Amazon review for Analytics
+  # =================================================================
+  AmazonReviewsParquetBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'AES256'
+  DeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: 'firehoseGlueAccess'
+            Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+                - glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+
+
+  # =================================================================
+  # S3 bucket for storing Amazon review for Analytics Policy
+  # =================================================================
+  DeliveryPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: firehose_delivery_policy
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - 's3:AbortMultipartUpload'
+              - 's3:GetBucketLocation'
+              - 's3:GetObject'
+              - 's3:ListBucket'
+              - 's3:ListBucketMultipartUploads'
+              - 's3:PutObject'
+            Resource:
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref AmazonReviewsParquetBucket
+              - !Join
+                - ''
+                - - 'arn:aws:s3:::'
+                  - !Ref AmazonReviewsParquetBucket
+                  - '*'
+          - Effect: Allow
+            Action: glue:GetTableVersions
+            Resource: '*'
+          - Effect: "Allow"
+            Action: "logs:PutLogEvents"
+            Resource: !GetAtt FirehoseLogGroup.Arn
+      Roles:
+        - !Ref DeliveryRole
+
+  # =================================================================
+  # Setup database for Glue Catalog
+  # =================================================================
+  ReviewDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: amazonreviews
+        Description: Database to hold tables for product reviews stream table
+
+  # =================================================================
+  # Setup table for Glue Catalog
+  # =================================================================
+  ReviewTable:
+    # Creating the table waits for the database to be created
+    DependsOn: ReviewDatabase
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref ReviewDatabase
+      TableInput:
+        Name: amazonreviews
+        Description: Define the columns of the amazon product review
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          compressionType: none
+          classification: parquet
+          EXTERNAL: TRUE
+          has_encrypted_data: FALSE
+        StorageDescriptor:
+          InputFormat: "org.apache.hadoop.mapred.TextInputFormat"
+          OutputFormat: "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormats"
+          SerdeInfo:
+            SerializationLibrary: "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"
+            Parameters:
+              "serialization.format": "1"
+          Compressed: false
+          Location: !Sub "s3://${AmazonReviewsParquetBucket}/"
+          Columns:
+            -   Name: eventid
+                Type: string
+            -   Name: eventname
+                Type: string
+            -   Name: eventversion
+                Type: string
+            -   Name: eventsource
+                Type: string
+            -   Name: awsregion
+                Type: string
+            -   Name: dynamodb_approximatecreationdatetime
+                Type: string
+            -   Name: dynamodb_keys_sk_s
+                Type: string
+            -   Name: dynamodb_keys_pk_s
+                Type: string
+            -   Name: dynamodb_newimage_total_votes_n
+                Type: string
+            -   Name: dynamodb_newimage_star_rating_n
+                Type: string
+            -   Name: dynamodb_newimage_sk_s
+                Type: string
+            -   Name: dynamodb_newimage_verified_purchase_s
+                Type: string
+            -   Name: dynamodb_newimage_pk_s
+                Type: string
+            -   Name: dynamodb_newimage_customer_id_n
+                Type: string
+            -   Name: dynamodb_newimage_helpful_votes_n
+                Type: string
+            -   Name: dynamodb_newimage_vine_s
+                Type: string
+            -   Name: dynamodb_newimage_review_body_s
+                Type: string
+            -   Name: dynamodb_newimage_review_headline_s
+                Type: string
+            -   Name: dynamodb_sequencenumber
+                Type: string
+            -   Name: dynamodb_sizebytes
+                Type: string
+            -   Name: dynamodb_streamviewtype
+                Type: string
+            -   Name: eventsourcearn
+                Type: string
+        #PartitionKeys:
+        #  - Name: year
+        #    Type: string
+        #  - Name: month
+        #    Type: string
+        #  - Name: day
+        #    Type: string
+        #  - Name: hour
+        #    Type: string
+Outputs:
+  AmazonReviewsS3Bucket:
+    Value: !Ref AmazonReviewsBucket
+    Export:
+      Name: AmazonReviewsS3Bucket
+  LambdaForAmazonReviewProcessing:
+    Value: !Ref LambdaRoleForEventsProcessing
+    Export:
+      Name: LambdaRoleForEventsProcessing

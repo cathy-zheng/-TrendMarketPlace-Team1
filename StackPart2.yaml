@@ -1,0 +1,19 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: "AWS Management Blog Addendum"
+Resources:
+  BlogManagedPolicy:
+    Type: 'AWS::IAM::ManagedPolicy'
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowReadWrite
+            Effect: Allow
+            Action:
+              - s3:Get*
+              - s3:List*
+              - s3:Put*
+            Resource: !Join ["", ["arn:aws:s3:::",!ImportValue AmazonReviewsS3Bucket, "/*"]]
+      Roles:
+        - !ImportValue LambdaRoleForEventsProcessing
